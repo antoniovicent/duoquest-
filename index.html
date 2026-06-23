@@ -288,3 +288,916 @@
 </div>
 
 <div class="container" id="app"></div>
+  <script>
+const SUPABASE_URL = 'https://advxktmidfdhirdgkknh.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFkdnhrdG1pZGZkaGlyZGdra25oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIxNDg0MzIsImV4cCI6MjA5NzcyNDQzMn0.7DUIVCCDB-qPmAfUH0PmW3z3huy81PnQISn-X4f3MDc';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+function setSync(ok, label){
+  document.getElementById('syncDot').classList.toggle('off', !ok);
+  document.getElementById('syncLabel').lastChild.textContent = label;
+}
+
+const AREAS = {
+  saude:   { name:'Saúde',        color:'#4ade80', icon:'💪' },
+  dev:     { name:'Desenvolvimento', color:'#fbbf24', icon:'📚' },
+  trabalho:{ name:'Trabalho',     color:'#60a5fa', icon:'💼' },
+  casal:   { name:'Casal',        color:'#ff5ca8', icon:'❤️' },
+};
+const STAR_XP = {1:20, 2:24, 3:30, 4:40, 5:50};
+
+let state = {
+  activeTab: 'casal',
+  players: {},
+  users: {},
+  tasks: [],
+  expensesPersonal: { p1:[], p2:[] },
+  expensesShared: [],
+  goals: [],
+  dateNight: null,
+  weeklyChallenge: null,
+  coupleStreak: { count:0, lastDate:null },
+  achievements: [],
+};
+
+function todayISO(){ return new Date().toISOString().slice(0,10); }
+function addDays(n){ const d=new Date(); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); }
+function otherId(id){ return id==='p1' ? 'p2' : 'p1'; }
+
+function getSession(){
+  try{ return JSON.parse(localStorage.getItem('duoquest_session')||'null'); }catch(e){ return null; }
+}
+function setSession(role){ localStorage.setItem('duoquest_session', JSON.stringify({role})); }
+function clearSession(){ localStorage.removeItem('duoquest_session'); }
+
+window.__selectedRole = 'p1';
+function renderRoleGrid(){
+  const grid = document.getElementById('roleGrid');
+  const roles = [
+    {id:'p1', label: (state.users.p1 && state.users.p1.label) || 'Jogador 1'},
+    {id:'p2', label: (state.users.p2 && state.users.p2.label) || 'Jogador 2'},
+    {id:'gamemaster', label:'Game Master'},
+  ];
+  grid.innerHTML = roles.map(r=>`<div class="role-btn ${window.__selectedRole===r.id?'active':''}" onclick="selectRole('${r.id}')">${r.label}</div>`).join('');
+}
+function selectRole(id){ window.__selectedRole=id; renderRoleGrid(); }
+async function tryLogin(){
+  const pin = document.getElementById('pinInput').value.trim();
+  const userKey = window.__selectedRole==='gamemaster' ? 'gm' : window.__selectedRole;
+  const u = state.users[userKey];
+  const errEl = document.getElementById('loginError');
+  if(!u){ errEl.textContent = 'Login não configurado ainda.'; return; }
+  if(pin !== u.pin){ errEl.textContent = 'PIN incorreto.'; document.getElementById('pinInput').value=''; return; }
+  errEl.textContent='';
+  setSession(window.__selectedRole);
+  window.__role = window.__selectedRole;
+  window.__meId = window.__role==='gamemaster' ? 'p1' : window.__role;
+  document.getElementById('loginScreen').classList.add('hidden');
+  state.activeTab = window.__role==='gamemaster' ? 'gm' : 'casal';
+  render();
+}
+function logout(){
+  clearSession();
+  window.__role=null;
+  closeDrawer();
+  showLogin();
+}
+function showLogin(){
+  document.getElementById('loginScreen').classList.remove('hidden');
+  renderRoleGrid();
+  document.getElementById('pinInput').value='';
+}
+function isGM(){ return window.__role==='gamemaster'; }
+
+async function loadAll(){
+  try{
+    const [usersR, playersR, tasksR, expPR, expSR, goalsR, dnR, wcR, csR, achR] = await Promise.all([
+      sb.from('app_users').select('*'),
+      sb.from('players').select('*'),
+      sb.from('tasks').select('*'),
+      sb.from('expenses_personal').select('*'),
+      sb.from('expenses_shared').select('*'),
+      sb.from('goals').select('*'),
+      sb.from('date_night').select('*').eq('id',1).maybeSingle(),
+      sb.from('weekly_challenge').select('*').eq('id',1).maybeSingle(),
+      sb.from('couple_streak').select('*').eq('id',1).maybeSingle(),
+      sb.from('achievements').select('*').order('date', {ascending:false}),
+    ]);
+
+    const firstErr = [usersR, playersR, tasksR, expPR, expSR, goalsR, dnR, wcR, csR, achR].find(r=>r.error);
+    if(firstErr) throw firstErr.error;
+
+    state.users = {};
+    (usersR.data||[]).forEach(u=>{ state.users[u.id] = u; });
+
+    state.players = {};
+    (playersR.data||[]).forEach(p=>{ state.players[p.id] = { id:p.id, name:p.name, birthdate:p.birthdate, color:p.color, xp:p.xp, avatar_url:p.avatar_url||null }; });
+
+    state.tasks = (tasksR.data||[]).map(t=>({...t}));
+    state.expensesPersonal = { p1:[], p2:[] };
+    (expPR.data||[]).forEach(e=>{ state.expensesPersonal[e.owner] = state.expensesPersonal[e.owner]||[]; state.expensesPersonal[e.owner].push({ id:e.id, type:e.type, desc:e.description, value:Number(e.value), date:e.date }); });
+    state.expensesShared = (expSR.data||[]).map(e=>({ id:e.id, desc:e.description, value:Number(e.value), category:e.category, date:e.date, split_p1:Number(e.split_p1||0), split_p2:Number(e.split_p2||0) }));
+    state.goals = (goalsR.data||[]).map(g=>({...g}));
+
+    state.dateNight = dnR.data ? { date:dnR.data.date, title:dnR.data.title, xp:dnR.data.xp, history:dnR.data.history, done:false } : { date:addDays(6), title:'Encontro a dois', xp:120, history:0, done:false };
+    state.weeklyChallenge = wcR.data ? { title:wcR.data.title, xp:wcR.data.xp, weekStart:wcR.data.week_start, doneBy:{p1:wcR.data.done_p1, p2:wcR.data.done_p2}, completedCount:wcR.data.completed_count } : { title:'Cozinhar uma receita nova juntos', xp:50, weekStart:todayISO(), doneBy:{p1:false,p2:false}, completedCount:0 };
+    state.coupleStreak = csR.data ? { count:csR.data.count, lastDate:csR.data.last_date } : { count:0, lastDate:null };
+    state.achievements = (achR.data||[]).map(a=>({...a}));
+
+    setSync(true, 'sincronizado');
+    document.getElementById('bootScreen').classList.add('hidden');
+
+    const session = getSession();
+    if(session && session.role){
+      window.__role = session.role;
+      window.__meId = window.__role==='gamemaster' ? 'p1' : window.__role;
+      state.activeTab = window.__role==='gamemaster' ? 'gm' : 'casal';
+      render();
+    } else {
+      showLogin();
+    }
+  }catch(err){
+    console.error(err);
+    setSync(false, 'erro de conexão');
+    document.getElementById('bootScreen').innerHTML = `
+      <div class="pixel" style="color:var(--danger); text-align:center; padding:0 20px;">FALHA AO CONECTAR</div>
+      <div style="color:var(--muted); font-size:13px; max-width:320px; text-align:center;">${err.message||'Verifique se as tabelas foram criadas.'}</div>
+      <button class="btn" onclick="location.reload()">Tentar de novo</button>
+    `;
+  }
+}
+
+function levelFromXp(xp){
+  let level = Math.floor(Math.sqrt(xp/25)) + 1;
+  let xpForLevel = (lv)=> 25*(lv-1)*(lv-1);
+  let curLevelXp = xpForLevel(level);
+  let nextLevelXp = xpForLevel(level+1);
+  let progress = (xp-curLevelXp)/(nextLevelXp-curLevelXp);
+  return { level, progress: Math.max(0,Math.min(1,progress)), curLevelXp, nextLevelXp };
+}
+function totalXp(player){ return Object.values(player.xp).reduce((a,b)=>a+b,0); }
+function age(birthdate){
+  const b = new Date(birthdate), now = new Date();
+  let a = now.getFullYear()-b.getFullYear();
+  if(now.getMonth()<b.getMonth() || (now.getMonth()===b.getMonth() && now.getDate()<b.getDate())) a--;
+  return a;
+}
+function fmtMoney(v){ return 'R$ ' + v.toLocaleString('pt-BR',{minimumFractionDigits:2, maximumFractionDigits:2}); }
+function fmtDate(iso){ const [y,m,d] = iso.split('-'); return `${d}/${m}`; }
+function daysBetween(isoA, isoB){ return Math.round((new Date(isoA)-new Date(isoB))/(1000*60*60*24)) * -1; }
+
+async function grantXp(owner, area, amount){
+  if(owner==='both'){
+    state.players.p1.xp[area] = (state.players.p1.xp[area]||0)+amount;
+    state.players.p2.xp[area] = (state.players.p2.xp[area]||0)+amount;
+    await Promise.all([persistPlayer('p1'), persistPlayer('p2')]);
+  } else {
+    state.players[owner].xp[area] = (state.players[owner].xp[area]||0)+amount;
+    await persistPlayer(owner);
+  }
+}
+async function persistPlayer(id){
+  const p = state.players[id];
+  const { error } = await sb.from('players').update({ name:p.name, birthdate:p.birthdate, color:p.color, xp:p.xp, avatar_url:p.avatar_url||null }).eq('id', id);
+  if(error) toast('Erro ao salvar: '+error.message, true);
+}
+function compressImage(file, maxSize=400, quality=0.82){
+  return new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onload = (e)=>{
+      const img = new Image();
+      img.onload = ()=>{
+        let w = img.width, h = img.height;
+        if(w>h){ if(w>maxSize){ h = h*(maxSize/w); w = maxSize; } }
+        else { if(h>maxSize){ w = w*(maxSize/h); h = maxSize; } }
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+async function handleAvatarUpload(id, input){
+  const file = input.files[0];
+  if(!file) return;
+  if(file.size > 8*1024*1024){ toast('Imagem muito grande, escolha uma menor.', true); return; }
+  toast('Enviando foto...');
+  try{
+    const dataUrl = await compressImage(file);
+    state.players[id].avatar_url = dataUrl;
+    await persistPlayer(id);
+    render();
+    toast('Foto atualizada! 📸');
+  }catch(err){ toast('Erro ao processar imagem: '+err.message, true); }
+}
+async function recordSharedActivity(){
+  const today = todayISO();
+  const s = state.coupleStreak;
+  if(s.lastDate === today) return;
+  if(s.lastDate && daysBetween(s.lastDate, today) === 1){ s.count += 1; } else { s.count = 1; }
+  s.lastDate = today;
+  const { error } = await sb.from('couple_streak').update({ count:s.count, last_date:s.lastDate }).eq('id',1);
+  if(error) toast('Erro ao salvar streak: '+error.message, true);
+}
+
+function navTabsFor(){
+  const base = [
+    {id:'casal', label:'❤️ Casal'},
+    {id:'saude', label:'💪 Saúde'},
+    {id:'dev', label:'📚 Dev'},
+    {id:'trabalho', label:'💼 Trabalho'},
+  ];
+  if(isGM()) base.push({id:'gm', label:'🛡️ GM'});
+  return base;
+}
+const DRAWER_TABS_BASE = [
+  {id:'tasks', label:'🗒️ Tarefas & Eventos'},
+  {id:'money', label:'💰 Gastos'},
+  {id:'achievements', label:'🏅 Conquistas'},
+  {id:'profile', label:'⚙️ Perfil'},
+];
+
+function render(){
+  const nav = document.getElementById('tabNav');
+  nav.innerHTML = navTabsFor().map(t=>`<button class="${state.activeTab===t.id?'active':''}" onclick="setTab('${t.id}')">${t.label}</button>`).join('');
+
+  renderDrawer();
+
+  const app = document.getElementById('app');
+  if(state.activeTab==='inicio') app.innerHTML = renderInicio();
+  else if(state.activeTab==='casal') app.innerHTML = renderCasal();
+  else if(['saude','dev','trabalho'].includes(state.activeTab)) app.innerHTML = renderAreaTab(state.activeTab);
+  else if(state.activeTab==='tasks') app.innerHTML = renderTasks();
+  else if(state.activeTab==='money') app.innerHTML = renderMoney();
+  else if(state.activeTab==='achievements') app.innerHTML = renderAchievements();
+  else if(state.activeTab==='profile') app.innerHTML = renderProfile();
+  else if(state.activeTab==='gm') app.innerHTML = renderGM();
+}
+function setTab(id){ state.activeTab=id; closeDrawer(); render(); }
+function goHome(){ state.activeTab = 'inicio'; closeDrawer(); render(); }
+function setMe(id){ window.__meId=id; render(); }
+function openDrawer(){
+  document.getElementById('drawer').classList.remove('closed');
+  document.getElementById('drawer').classList.add('open');
+  document.getElementById('drawerOverlay').classList.remove('hidden');
+}
+function closeDrawer(){
+  document.getElementById('drawer').classList.remove('open');
+  document.getElementById('drawer').classList.add('closed');
+  document.getElementById('drawerOverlay').classList.add('hidden');
+}
+function renderDrawer(){
+  const drawer = document.getElementById('drawer');
+  const myLabel = isGM() ? 'Game Master' : (state.players[window.__meId]?state.players[window.__meId].name:'');
+  drawer.innerHTML = `
+    <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+      <div class="brand-mark"></div>
+      <div class="brand-name" style="font-size:11px;">DUO<span style="color:var(--pink)">QUEST</span></div>
+    </div>
+    <div style="font-size:11px; color:var(--muted); margin-bottom:14px;">Logado como <b style="color:var(--text)">${myLabel}</b></div>
+    <div class="drawer-item" onclick="goHome()">🏠 Início</div>
+    <div class="drawer-title">Menu</div>
+    ${DRAWER_TABS_BASE.map(t=>`<div class="drawer-item ${state.activeTab===t.id?'active':''}" onclick="setTab('${t.id}')">${t.label}</div>`).join('')}
+    <div class="drawer-title">Conta</div>
+    <div class="drawer-item" onclick="logout()" style="color:var(--danger);">🚪 Sair</div>
+  `;
+}
+
+function pixelAvatar(color, size=64){
+  return `<svg width="${size}" height="${size*1.15}" viewBox="0 0 16 18" shape-rendering="crispEdges" xmlns="http://www.w3.org/2000/svg">
+    <rect x="5" y="0" width="6" height="2" fill="#3a2c1a"/><rect x="4" y="1" width="1" height="2" fill="#3a2c1a"/><rect x="11" y="1" width="1" height="2" fill="#3a2c1a"/>
+    <rect x="5" y="2" width="6" height="4" fill="#f3c08a"/><rect x="6" y="4" width="1" height="1" fill="#1a1422"/><rect x="9" y="4" width="1" height="1" fill="#1a1422"/>
+    <rect x="4" y="6" width="8" height="5" fill="${color}"/><rect x="4" y="6" width="8" height="1" fill="${shade(color,-20)}"/>
+    <rect x="2" y="7" width="2" height="4" fill="${shade(color,-10)}"/><rect x="12" y="7" width="2" height="4" fill="${shade(color,-10)}"/>
+    <rect x="2" y="11" width="2" height="1" fill="#f3c08a"/><rect x="12" y="11" width="2" height="1" fill="#f3c08a"/>
+    <rect x="4" y="11" width="3" height="5" fill="#2b2240"/><rect x="9" y="11" width="3" height="5" fill="#2b2240"/>
+    <rect x="4" y="16" width="3" height="2" fill="#161222"/><rect x="9" y="16" width="3" height="2" fill="#161222"/>
+  </svg>`;
+}
+function shade(hex, percent){
+  const f=parseInt(hex.slice(1),16), t=percent<0?0:255, p=Math.abs(percent)/100;
+  const R=f>>16, G=(f>>8)&0x00FF, B=f&0x0000FF;
+  const r=Math.round((t-R)*p)+R, g=Math.round((t-G)*p)+G, b=Math.round((t-B)*p)+B;
+  return "#"+(0x1000000+r*0x10000+g*0x100+b).toString(16).slice(1);
+}
+function renderAvatar(p, size=60){
+  if(p.avatar_url){
+    return `<div style="width:${size}px; height:${size*1.15}px; border-radius:10px; overflow:hidden; border:2px solid ${p.color}; box-shadow:0 0 10px ${p.color}55;">
+      <img src="${p.avatar_url}" style="width:100%; height:100%; object-fit:cover;"></div>`;
+  }
+  return pixelAvatar(p.color, size);
+}
+
+function renderInicio(){
+  const players = Object.values(state.players);
+  if(players.length<2) return `<div class="empty-state">Carregando perfis...</div>`;
+  const me = state.players[window.__meId];
+  const lvl = levelFromXp(totalXp(me));
+
+  const areaMinis = Object.entries(AREAS).map(([key,info])=>{
+    const xp = me.xp[key]||0;
+    const l = levelFromXp(xp);
+    return `<div class="area-mini">
+      <div class="dot" style="background:${info.color}"></div>
+      <span style="width:120px; color:var(--muted)">${info.icon} ${info.name}</span>
+      <div class="bar"><i style="width:${Math.round(l.progress*100)}%; background:${info.color}"></i></div>
+      <span class="lvl">Lv${l.level}</span>
+    </div>`;
+  }).join('');
+
+  const meToggle = isGM() ? `
+    <div class="me-toggle">
+      <button class="${window.__meId==='p1'?'active':''}" onclick="setMe('p1')">Ver como ${state.players.p1.name}</button>
+      <button class="${window.__meId==='p2'?'active':''}" onclick="setMe('p2')">Ver como ${state.players.p2.name}</button>
+    </div>` : '';
+
+  return `
+    ${meToggle}
+    <div class="card">
+      <div class="char-hero">
+        <div class="char-avatar-big" style="border-color:${me.color};">${renderAvatar(me, 150)}</div>
+        <div class="char-info">
+          <div class="char-name">${me.name}</div>
+          <div class="char-sub">${age(me.birthdate)} anos</div>
+          <div class="char-lvl">NÍVEL ${lvl.level} · ${totalXp(me)} XP TOTAL</div>
+          <div class="xp-track"><div class="xp-fill" style="width:${Math.round(lvl.progress*100)}%"></div></div>
+        </div>
+      </div>
+      <div class="area-mini-list">${areaMinis}</div>
+    </div>
+  `;
+}
+
+function renderCasal(){
+  const players = Object.values(state.players);
+  if(players.length<2) return `<div class="empty-state">Carregando...</div>`;
+  const partner = state.players[otherId(window.__meId)];
+  const lvl = levelFromXp(totalXp(partner));
+
+  const vinculoXp = state.players.p1.xp.casal + state.players.p2.xp.casal;
+  const vinculoLvl = levelFromXp(vinculoXp);
+
+  const dn = state.dateNight;
+  const dnDays = daysBetween(todayISO(), dn.date);
+  const dnUrgent = dnDays <= 1;
+
+  const wc = state.weeklyChallenge;
+  const wcDone = wc.doneBy.p1 && wc.doneBy.p2;
+
+  const rankChips = Object.entries(AREAS).map(([key,info])=>{
+    const [p1,p2] = players;
+    const x1 = p1.xp[key]||0, x2 = p2.xp[key]||0;
+    let winner, crown='';
+    if(x1===x2){ winner = 'Empate'; } else { winner = x1>x2 ? p1.name : p2.name; crown='👑'; }
+    return `<div class="rank-chip">
+      <div class="area-dot" style="background:${info.color}"></div>
+      <div><div class="label">${info.icon} ${info.name}</div><div class="winner">${crown} ${winner}</div></div>
+    </div>`;
+  }).join('');
+
+  return `
+    <h2 class="section-title">Seu parceiro(a)</h2>
+    <div class="card" style="margin-bottom:22px;">
+      <div class="char-hero" style="margin-bottom:0;">
+        <div class="char-avatar-big" style="border-color:${partner.color}; width:100px; height:114px;">${renderAvatar(partner, 100)}</div>
+        <div class="char-info">
+          <div class="char-name" style="font-size:19px;">${partner.name}</div>
+          <div class="char-sub">${age(partner.birthdate)} anos</div>
+          <div class="char-lvl" style="font-size:11px;">NÍVEL ${lvl.level} · ${totalXp(partner)} XP</div>
+          <div class="xp-track"><div class="xp-fill" style="width:${Math.round(lvl.progress*100)}%"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:22px; border-color:var(--pink);">
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:6px; margin-bottom:8px;">
+        <div style="font-weight:800; font-size:14px;">💞 Vínculo do casal</div>
+        <div class="pixel" style="font-size:11px; color:var(--pink);">NÍVEL ${vinculoLvl.level}</div>
+      </div>
+      <div class="xp-track" style="height:12px;"><div class="xp-fill" style="width:${Math.round(vinculoLvl.progress*100)}%; background:linear-gradient(90deg, var(--pink), var(--purple));"></div></div>
+      <div style="font-size:11px; color:var(--muted); margin-top:6px;">${vinculoXp} XP acumulados juntos · 🔥 streak de ${state.coupleStreak.count} dia${state.coupleStreak.count===1?'':'s'} fazendo algo em conjunto</div>
+    </div>
+
+    <div class="grid grid-2" style="margin-bottom:22px;">
+      <div class="card" style="${dnUrgent?'border-color:var(--amber);':''}">
+        <div style="font-weight:800; font-size:13.5px; margin-bottom:6px;">📅 Próximo Encontro</div>
+        <div style="font-size:22px; font-weight:800; font-family:'Press Start 2P'; color:${dnUrgent?'var(--amber)':'var(--purple-bright)'}; margin:8px 0;">
+          ${dnDays<=0 ? 'É HOJE!' : dnDays+' dia'+(dnDays===1?'':'s')}
+        </div>
+        <div style="font-size:11px; color:var(--muted); margin-bottom:12px;">Vale ${dn.xp} XP de Vínculo · marcado pra ${fmtDate(dn.date)} · ${dn.history} já realizados</div>
+        <button class="btn small" onclick="completeDateNight()">Registrar encontro ✓</button>
+      </div>
+
+      <div class="card" style="${wcDone?'border-color:var(--green);':''}">
+        <div style="font-weight:800; font-size:13.5px; margin-bottom:6px;">🤝 Desafio da semana</div>
+        <div style="font-size:13.5px; font-weight:700; margin:6px 0;">${wc.title}</div>
+        <div style="font-size:11px; color:var(--muted); margin-bottom:10px;">+${wc.xp} XP · só conta se os dois confirmarem</div>
+        <div style="display:flex; gap:8px; margin-bottom:10px;">
+          <button class="btn small ${wc.doneBy.p1?'secondary':''}" onclick="markChallengeDone('p1')" ${wc.doneBy.p1?'disabled':''}>${wc.doneBy.p1?'✓ ':''}${state.players.p1.name}</button>
+          <button class="btn small ${wc.doneBy.p2?'secondary':''}" onclick="markChallengeDone('p2')" ${wc.doneBy.p2?'disabled':''}>${wc.doneBy.p2?'✓ ':''}${state.players.p2.name}</button>
+        </div>
+        <details>
+          <summary style="cursor:pointer; font-size:11px; color:var(--muted);">Definir novo desafio</summary>
+          <div class="form-row" style="margin-top:10px;">
+            <div class="field"><label>Título</label><input id="wc-title" placeholder="Ex: Cozinhar juntos"></div>
+            <div class="field"><label>XP</label><input id="wc-xp" type="number" value="50"></div>
+          </div>
+          <button class="btn secondary small" onclick="newWeeklyChallenge()">Salvar desafio</button>
+        </details>
+      </div>
+    </div>
+
+    <h2 class="section-title">Ranking por área</h2>
+    <div class="rank-strip">${rankChips}</div>
+
+    <h2 class="section-title">Metas do casal</h2>
+    <div class="card">${state.goals.filter(g=>g.area==='casal').length ? state.goals.filter(g=>g.area==='casal').map(goalCard).join('') : `<div class="empty-state">Nenhuma meta de casal ainda — adicione em uma das abas de área.</div>`}</div>
+  `;
+}
+
+const BADGES = [
+  {id:'b1', icon:'🥉', label:'Nível 3', test:(lvl)=>lvl>=3},
+  {id:'b2', icon:'🥈', label:'Nível 6', test:(lvl)=>lvl>=6},
+  {id:'b3', icon:'🥇', label:'Nível 10', test:(lvl)=>lvl>=10},
+  {id:'b4', icon:'💎', label:'Nível 15', test:(lvl)=>lvl>=15},
+];
+function renderAreaTab(areaKey){
+  const info = AREAS[areaKey];
+  const goals = state.goals.filter(g=>g.area===areaKey);
+  const totalLvl = levelFromXp(state.players.p1.xp[areaKey] + state.players.p2.xp[areaKey]);
+  const badgesHtml = BADGES.map(b=>`<div class="badge ${b.test(totalLvl.level)?'unlocked':'locked'}" title="${b.label}">${b.icon}</div>`).join('');
+
+  const playerBars = Object.values(state.players).map(p=>{
+    const l = levelFromXp(p.xp[areaKey]||0);
+    return `<div class="area-mini"><div class="dot" style="background:${info.color}"></div><span style="width:90px; color:var(--muted)">${p.name}</span><div class="bar"><i style="width:${Math.round(l.progress*100)}%; background:${info.color}"></i></div><span class="lvl">Lv${l.level}</span></div>`;
+  }).join('');
+
+  return `
+  <h2 class="section-title">${info.icon} ${info.name}</h2>
+  <div class="card" style="margin-bottom:18px;">
+    <div style="font-size:11px; color:var(--muted); margin-bottom:10px;">Nível combinado do casal: ${totalLvl.level}</div>
+    <div class="area-mini-list">${playerBars}</div>
+    <div class="badges-row">${badgesHtml}</div>
+  </div>
+
+  <div class="card">
+    <div class="form-card">
+      <div class="field"><label>Meta</label><input id="g-title" placeholder="Ex: Treinar 4x por semana"></div>
+      <div class="form-row">
+        <div class="field"><label>Responsável</label>
+          <select id="g-owner"><option value="${window.__meId}">Só eu</option><option value="both">Casal</option>${isGM()?`<option value="${otherId(window.__meId)}">${state.players[otherId(window.__meId)].name}</option>`:''}</select>
+        </div>
+        <div class="field"><label>XP de recompensa</label><input id="g-xp" type="number" value="30"></div>
+      </div>
+      <button class="btn" onclick="addGoal('${areaKey}')">+ Adicionar meta</button>
+    </div>
+    ${goals.length ? goals.map(g=>goalCard(g)).join('') : `<div class="empty-state">Nenhuma meta nessa área ainda.</div>`}
+  </div>`;
+}
+function goalCard(g){
+  const ownerLabel = g.owner==='both' ? 'Casal' : (state.players[g.owner]?state.players[g.owner].name:g.owner);
+  return `
+  <div class="goal-card">
+    <div class="check" onclick="toggleGoal(${g.id})" style="${g.done?'background:var(--purple); border-color:var(--purple);':''}">${g.done?'✓':''}</div>
+    <div class="goal-info">
+      <div class="goal-title" style="${g.done?'text-decoration:line-through; opacity:.6;':''}">${g.title}</div>
+      <div class="goal-sub"><span class="tag ${g.owner==='both'?'shared':'solo'}">${ownerLabel}</span></div>
+    </div>
+    <div class="goal-xp">+${g.xp} XP</div>
+  </div>`;
+}
+async function addGoal(areaKey){
+  const title = document.getElementById('g-title').value.trim();
+  if(!title){ toast('Escreva o título da meta 🙂'); return; }
+  const payload = { area: areaKey, title, owner: document.getElementById('g-owner').value, xp: parseInt(document.getElementById('g-xp').value)||20, done:false };
+  const { data, error } = await sb.from('goals').insert(payload).select().single();
+  if(error){ toast('Erro ao salvar: '+error.message, true); return; }
+  state.goals.push(data);
+  render();
+  toast('Meta criada! Vão com tudo 🚀');
+}
+async function toggleGoal(id){
+  const g = state.goals.find(x=>x.id===id);
+  const wasNotDone = !g.done;
+  g.done = !g.done;
+  const { error } = await sb.from('goals').update({ done:g.done }).eq('id', id);
+  if(error){ toast('Erro ao salvar: '+error.message, true); }
+  if(g.done && wasNotDone){
+    await grantXp(g.owner, g.area, g.xp);
+    if(g.owner==='both') await recordSharedActivity();
+    toast(`+${g.xp} XP conquistado! 🏆`);
+  }
+  render();
+}
+
+async function completeDateNight(){
+  const dn = state.dateNight;
+  await grantXp('both', 'casal', dn.xp);
+  await recordSharedActivity();
+  dn.history += 1;
+  dn.date = addDays(14);
+  const { error } = await sb.from('date_night').update({ date: dn.date, history: dn.history }).eq('id',1);
+  if(error){ toast('Erro ao salvar: '+error.message, true); }
+  toast(`Encontro registrado! +${dn.xp} XP de Vínculo 💜`);
+  render();
+}
+async function markChallengeDone(player){
+  const c = state.weeklyChallenge;
+  c.doneBy[player] = true;
+  const patch = player==='p1' ? {done_p1:true} : {done_p2:true};
+  let err1 = (await sb.from('weekly_challenge').update(patch).eq('id',1)).error;
+  if(err1) toast('Erro ao salvar: '+err1.message, true);
+  if(c.doneBy.p1 && c.doneBy.p2){
+    await grantXp('both', 'casal', c.xp);
+    c.completedCount += 1;
+    await recordSharedActivity();
+    await sb.from('weekly_challenge').update({ completed_count: c.completedCount }).eq('id',1);
+    toast(`Desafio da semana concluído pelos dois! +${c.xp} XP 🏆`);
+  } else {
+    toast(`${state.players[player].name} confirmou! Falta o outro completar.`);
+  }
+  render();
+}
+async function newWeeklyChallenge(){
+  const title = document.getElementById('wc-title').value.trim();
+  if(!title){ toast('Escreva o desafio da semana 🙂'); return; }
+  const xp = parseInt(document.getElementById('wc-xp').value)||50;
+  const weekStart = todayISO();
+  const { error } = await sb.from('weekly_challenge').update({ title, xp, week_start: weekStart, done_p1:false, done_p2:false }).eq('id',1);
+  if(error){ toast('Erro ao salvar: '+error.message, true); return; }
+  state.weeklyChallenge = { title, xp, weekStart, doneBy:{p1:false,p2:false}, completedCount: state.weeklyChallenge.completedCount };
+  render();
+  toast('Novo desafio da semana definido!');
+}
+
+function taskRow(t){
+  const owner = state.players[t.owner];
+  const stars = t.stars || 1;
+  return `
+  <div class="list-item ${t.done?'done':''}">
+    <div class="check" onclick="toggleTask(${t.id})">${t.done?'✓':''}</div>
+    <div class="item-main">
+      <div class="item-title ${t.done?'strike':''}">${t.title}</div>
+      <div class="item-sub">
+        <span>${fmtDate(t.date)}${t.time?' · '+t.time:''}</span>
+        <span class="tag ${t.shared?'shared':'solo'}">${t.shared?'Casal':(owner?owner.name:'')}</span>
+        ${t.area?`<span class="tag area">${AREAS[t.area].icon} ${AREAS[t.area].name}</span>`:''}
+        <span class="tag star">${'⭐'.repeat(stars)} · ${STAR_XP[stars]} XP</span>
+        <span class="tag area">${t.type==='evento'?'Evento':'Tarefa'}</span>
+      </div>
+    </div>
+    <button class="btn danger small" onclick="deleteTask(${t.id})">Excluir</button>
+  </div>`;
+}
+function renderTasks(){
+  const filter = window.__taskFilter || 'todos';
+  let list = state.tasks.slice().sort((a,b)=> (a.date+(a.time||'')).localeCompare(b.date+(b.time||'')));
+  if(!isGM()){
+    list = list.filter(t=> t.shared || t.owner===window.__meId);
+  }
+  if(filter==='p1') list = list.filter(t=>!t.shared && t.owner==='p1');
+  if(filter==='p2') list = list.filter(t=>!t.shared && t.owner==='p2');
+  if(filter==='shared') list = list.filter(t=>t.shared);
+
+  window.__newTaskShared = window.__newTaskShared===undefined ? true : window.__newTaskShared;
+  window.__newTaskStars = window.__newTaskStars || 1;
+
+  return `
+  <h2 class="section-title">Tarefas & Eventos</h2>
+  <div class="card">
+    <div class="form-card">
+      <div class="field"><label>Título</label><input id="t-title" placeholder="Ex: Consulta médica"></div>
+      <div class="form-row">
+        <div class="field"><label>Tipo</label><select id="t-type"><option value="tarefa">Tarefa</option><option value="evento">Evento</option></select></div>
+        <div class="field"><label>Área (pra valer XP)</label><select id="t-area"><option value="">—</option>${Object.entries(AREAS).map(([k,v])=>`<option value="${k}">${v.icon} ${v.name}</option>`).join('')}</select></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label>Data</label><input id="t-date" type="date" value="${todayISO()}"></div>
+        <div class="field"><label>Horário (opcional)</label><input id="t-time" type="time"></div>
+      </div>
+      <div class="field">
+        <label>Visibilidade</label>
+        <div class="toggle-row">
+          <button class="${window.__newTaskShared?'':'active'}" onclick="setNewTaskShared(false)">Só eu</button>
+          <button class="${window.__newTaskShared?'active':''}" onclick="setNewTaskShared(true)">Casal (aparece pros dois)</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Dificuldade / XP</label>
+        <div class="star-row">
+          ${[1,2,3,4,5].map(n=>`<button class="${window.__newTaskStars===n?'active':''}" onclick="setNewTaskStars(${n})">${'⭐'.repeat(n)}</button>`).join('')}
+        </div>
+        <div style="font-size:11px; color:var(--muted); margin-top:6px;">Vale ${STAR_XP[window.__newTaskStars]} XP ao concluir (se tiver área marcada)</div>
+      </div>
+      <button class="btn" onclick="addTask()">+ Adicionar</button>
+    </div>
+
+    <div class="subtabs">
+      <button class="${filter==='todos'?'active':''}" onclick="setTaskFilter('todos')">Todos</button>
+      <button class="${filter==='p1'?'active':''}" onclick="setTaskFilter('p1')">${state.players.p1.name}</button>
+      <button class="${filter==='p2'?'active':''}" onclick="setTaskFilter('p2')">${state.players.p2.name}</button>
+      <button class="${filter==='shared'?'active':''}" onclick="setTaskFilter('shared')">Casal</button>
+    </div>
+
+    ${list.length ? list.map(taskRow).join('') : `<div class="empty-state">Nada por aqui ainda. Adicione a primeira tarefa! ✨</div>`}
+  </div>`;
+}
+function setTaskFilter(f){ window.__taskFilter=f; render(); }
+function setNewTaskShared(v){ window.__newTaskShared=v; render(); }
+function setNewTaskStars(n){ window.__newTaskStars=n; render(); }
+async function addTask(){
+  const title = document.getElementById('t-title').value.trim();
+  if(!title){ toast('Dá um título pra tarefa antes! 😄'); return; }
+  const shared = !!window.__newTaskShared;
+  const stars = window.__newTaskStars || 1;
+  const payload = {
+    type: document.getElementById('t-type').value, title,
+    date: document.getElementById('t-date').value || todayISO(),
+    time: document.getElementById('t-time').value || null,
+    owner: window.__meId,
+    shared,
+    area: document.getElementById('t-area').value || null,
+    stars,
+    done:false,
+  };
+  const { data, error } = await sb.from('tasks').insert(payload).select().single();
+  if(error){ toast('Erro ao salvar: '+error.message, true); return; }
+  state.tasks.push(data);
+  render();
+  toast('Adicionado à agenda!');
+}
+async function toggleTask(id){
+  const t = state.tasks.find(x=>x.id===id);
+  t.done = !t.done;
+  const { error } = await sb.from('tasks').update({ done:t.done }).eq('id', id);
+  if(error){ toast('Erro ao salvar: '+error.message, true); }
+  if(t.done && t.area){
+    const xp = STAR_XP[t.stars||1];
+    await grantXp(t.shared ? 'both' : t.owner, t.area, xp);
+    if(t.shared) await recordSharedActivity();
+    toast(`+${xp} XP! 🎮`);
+  }
+  render();
+}
+async function deleteTask(id){
+  const { error } = await sb.from('tasks').delete().eq('id', id);
+  if(error){ toast('Erro ao excluir: '+error.message, true); return; }
+  state.tasks = state.tasks.filter(x=>x.id!==id);
+  render();
+}
+
+function renderMoney(){
+  const sub = window.__moneyTab || 'mine';
+  const tabs = [{id:'mine', label:'Meus gastos'}];
+  if(isGM()) tabs.push({id:'partner', label:state.players[otherId(window.__meId)].name});
+  tabs.push({id:'shared', label:'Gastos do casal'});
+
+  const tabsHtml = `<div class="subtabs">${tabs.map(t=>`<button class="${sub===t.id?'active':''}" onclick="setMoneyTab('${t.id}')">${t.label}</button>`).join('')}</div>`;
+
+  if(sub==='shared'){
+    const list = state.expensesShared;
+    const total = list.reduce((a,b)=>a+b.value,0);
+    const totalP1 = list.reduce((a,b)=>a+b.split_p1,0);
+    const totalP2 = list.reduce((a,b)=>a+b.split_p2,0);
+    return `
+    <h2 class="section-title">Gastos</h2>
+    <div class="card">
+      ${tabsHtml}
+      <div class="totals-row">
+        <div class="total-pill"><div class="l">Total gasto juntos</div><div class="v" style="color:var(--pink)">${fmtMoney(total)}</div></div>
+        <div class="total-pill"><div class="l">${state.players.p1.name}</div><div class="v">${fmtMoney(totalP1)}</div></div>
+        <div class="total-pill"><div class="l">${state.players.p2.name}</div><div class="v">${fmtMoney(totalP2)}</div></div>
+      </div>
+      <div class="form-card">
+        <div class="form-row">
+          <div class="field"><label>Descrição</label><input id="s-desc" placeholder="Ex: Jantar fora"></div>
+          <div class="field"><label>Valor total (R$)</label><input id="s-value" type="number" step="0.01" placeholder="0,00" oninput="updateSplitPreview()"></div>
+        </div>
+        <div class="field"><label>Quanto cada um paga</label>
+          <div class="form-row">
+            <input id="s-split-me" type="number" step="0.01" placeholder="Sua parte (R$)" oninput="updateSplitPreview()">
+            <input id="s-split-partner" type="number" step="0.01" placeholder="Parte do(a) parceiro(a) (R$)" readonly>
+          </div>
+          <div style="font-size:11px; color:var(--muted); margin-top:6px;">Pode ser 100/0 — só precisa fechar com o total.</div>
+        </div>
+        <div class="form-row">
+          <div class="field"><label>Categoria</label><input id="s-cat" placeholder="Ex: Lazer, Viagem, Casa"></div>
+          <div class="field"><label>Data</label><input id="s-date" type="date" value="${todayISO()}"></div>
+        </div>
+        <button class="btn" onclick="addShared()">+ Adicionar gasto compartilhado</button>
+      </div>
+      ${list.length ? list.map(e=>`
+        <div class="expense-row">
+          <div>${e.desc} <span style="color:var(--muted); font-size:11px;">· ${e.category} · ${fmtDate(e.date)} · ${state.players.p1.name}: ${fmtMoney(e.split_p1)} / ${state.players.p2.name}: ${fmtMoney(e.split_p2)}</span></div>
+          <div class="expense-amt out">${fmtMoney(e.value)}</div>
+        </div>`).join('') : `<div class="empty-state">Nenhum gasto em conjunto registrado ainda.</div>`}
+    </div>`;
+  }
+
+  const who = sub==='partner' ? otherId(window.__meId) : window.__meId;
+  const list = state.expensesPersonal[who]||[];
+  const gastos = list.filter(e=>e.type==='gasto').reduce((a,b)=>a+b.value,0);
+  const receb = list.filter(e=>e.type==='recebivel').reduce((a,b)=>a+b.value,0);
+  const readOnly = sub==='partner';
+  return `
+  <h2 class="section-title">Gastos</h2>
+  <div class="card">
+    ${tabsHtml}
+    <div class="totals-row">
+      <div class="total-pill"><div class="l">Recebíveis</div><div class="v" style="color:var(--green)">${fmtMoney(receb)}</div></div>
+      <div class="total-pill"><div class="l">Gastos</div><div class="v" style="color:var(--danger)">${fmtMoney(gastos)}</div></div>
+      <div class="total-pill"><div class="l">Saldo</div><div class="v" style="color:var(--purple-bright)">${fmtMoney(receb-gastos)}</div></div>
+    </div>
+    ${readOnly ? `<div class="empty-state" style="margin-bottom:14px;">Visualização do Game Master — somente leitura.</div>` : `
+    <div class="form-card">
+      <div class="form-row">
+        <div class="field"><label>Descrição</label><input id="m-desc" placeholder="Ex: Salário, Mercado..."></div>
+        <div class="field"><label>Tipo</label><select id="m-type"><option value="gasto">Gasto</option><option value="recebivel">Recebível</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label>Valor (R$)</label><input id="m-value" type="number" step="0.01" placeholder="0,00"></div>
+        <div class="field"><label>Data</label><input id="m-date" type="date" value="${todayISO()}"></div>
+      </div>
+      <button class="btn" onclick="addPersonal()">+ Adicionar lançamento</button>
+    </div>`}
+    ${list.length ? list.slice().reverse().map(e=>`
+      <div class="expense-row">
+        <div>${e.desc} <span style="color:var(--muted); font-size:11px;">· ${fmtDate(e.date)}</span></div>
+        <div class="expense-amt ${e.type==='recebivel'?'in':'out'}">${e.type==='recebivel'?'+':'-'} ${fmtMoney(e.value)}</div>
+      </div>`).join('') : `<div class="empty-state">Sem lançamentos pessoais ainda.</div>`}
+  </div>`;
+}
+function setMoneyTab(t){ window.__moneyTab=t; render(); }
+function updateSplitPreview(){
+  const total = parseFloat(document.getElementById('s-value').value)||0;
+  const me = parseFloat(document.getElementById('s-split-me').value)||0;
+  document.getElementById('s-split-partner').value = (total-me).toFixed(2);
+}
+async function addPersonal(){
+  const desc = document.getElementById('m-desc').value.trim();
+  const value = parseFloat(document.getElementById('m-value').value);
+  if(!desc || !value){ toast('Preencha descrição e valor 🙂'); return; }
+  const who = window.__meId;
+  const payload = { owner: who, type: document.getElementById('m-type').value, description: desc, value, date: document.getElementById('m-date').value||todayISO() };
+  const { data, error } = await sb.from('expenses_personal').insert(payload).select().single();
+  if(error){ toast('Erro ao salvar: '+error.message, true); return; }
+  state.expensesPersonal[who].push({ id:data.id, type:data.type, desc:data.description, value:Number(data.value), date:data.date });
+  render();
+  toast('Lançamento adicionado!');
+}
+async function addShared(){
+  const desc = document.getElementById('s-desc').value.trim();
+  const value = parseFloat(document.getElementById('s-value').value);
+  const splitMe = parseFloat(document.getElementById('s-split-me').value);
+  if(!desc || !value || isNaN(splitMe)){ toast('Preencha descrição, valor total e sua parte 🙂'); return; }
+  const splitPartner = Number((value-splitMe).toFixed(2));
+  if(splitPartner < -0.01){ toast('Sua parte não pode ser maior que o total 🙂'); return; }
+  const split_p1 = window.__meId==='p1' ? splitMe : splitPartner;
+  const split_p2 = window.__meId==='p1' ? splitPartner : splitMe;
+  const payload = { description: desc, value, category: document.getElementById('s-cat').value||'Geral', date: document.getElementById('s-date').value||todayISO(), split_p1, split_p2 };
+  const { data, error } = await sb.from('expenses_shared').insert(payload).select().single();
+  if(error){ toast('Erro ao salvar: '+error.message, true); return; }
+  state.expensesShared.push({ id:data.id, desc:data.description, value:Number(data.value), category:data.category, date:data.date, split_p1:Number(data.split_p1), split_p2:Number(data.split_p2) });
+  render();
+  toast('Gasto do casal adicionado!');
+}
+
+function renderAchievements(){
+  const list = state.achievements;
+  const formHtml = isGM() ? `
+    <div class="form-card">
+      <div class="field"><label>Título</label><input id="ach-title" placeholder="Ex: Primeiro encontro"></div>
+      <div class="field"><label>Descrição (opcional)</label><textarea id="ach-desc" rows="2" placeholder="Conte a lembrancinha..."></textarea></div>
+      <div class="form-row">
+        <div class="field"><label>Data</label><input id="ach-date" type="date" value="${todayISO()}"></div>
+        <div class="field"><label>Foto (opcional)</label><input type="file" accept="image/*" id="ach-img"></div>
+      </div>
+      <button class="btn" onclick="addAchievement()">+ Adicionar conquista</button>
+    </div>` : '';
+  return `
+  <h2 class="section-title">Conquistas</h2>
+  <div class="card">
+    ${formHtml}
+    ${list.length ? list.map(achCard).join('') : `<div class="empty-state">Nenhuma conquista registrada ainda — o Game Master vai adicionando as lembrancinhas aqui! 🏅</div>`}
+  </div>`;
+}
+function achCard(a){
+  const img = a.image_url
+    ? `<img class="ach-img" src="${a.image_url}">`
+    : `<div class="ach-img placeholder">🏅</div>`;
+  return `
+  <div class="ach-card">
+    ${img}
+    <div class="ach-body">
+      <div class="ach-title">${a.title}</div>
+      <div class="ach-date">${fmtDate(a.date)}</div>
+      ${a.description ? `<div class="ach-desc">${a.description}</div>` : ''}
+    </div>
+    ${isGM() ? `<div style="padding:10px;"><button class="btn danger small" onclick="deleteAchievement(${a.id})">Excluir</button></div>` : ''}
+  </div>`;
+}
+async function addAchievement(){
+  if(!isGM()) return;
+  const title = document.getElementById('ach-title').value.trim();
+  if(!title){ toast('Dá um título pra conquista 🙂'); return; }
+  const description = document.getElementById('ach-desc').value.trim();
+  const date = document.getElementById('ach-date').value || todayISO();
+  const fileInput = document.getElementById('ach-img');
+  let image_url = null;
+  try{
+    if(fileInput.files[0]){
+      image_url = await compressImage(fileInput.files[0], 500, 0.8);
+    }
+  }catch(err){ toast('Erro ao processar imagem: '+err.message, true); return; }
+  const { data, error } = await sb.from('achievements').insert({ title, description, date, image_url }).select().single();
+  if(error){ toast('Erro ao salvar: '+error.message, true); return; }
+  state.achievements.unshift(data);
+  render();
+  toast('Conquista registrada! 🏅💜');
+}
+async function deleteAchievement(id){
+  if(!isGM()) return;
+  const { error } = await sb.from('achievements').delete().eq('id', id);
+  if(error){ toast('Erro ao excluir: '+error.message, true); return; }
+  state.achievements = state.achievements.filter(a=>a.id!==id);
+  render();
+  toast('Conquista removida.');
+}
+
+function renderProfile(){
+  const list = isGM() ? Object.values(state.players) : [state.players[window.__meId]];
+  return `
+  <h2 class="section-title">Perfil</h2>
+  <div class="grid grid-2">
+    ${list.map(p=>`
+      <div class="card">
+        <div style="display:flex; gap:16px; align-items:center; margin-bottom:16px;">
+          <div class="avatar-box" style="width:70px; height:80px;">${renderAvatar(p,52)}</div>
+          <div><div class="player-name" style="font-weight:800;">${p.name}</div><div class="player-sub" style="color:var(--muted); font-size:12px;">${age(p.birthdate)} anos · nasc. ${fmtDate(p.birthdate)}</div></div>
+        </div>
+        <div class="field"><label>Foto (carta RPG)</label><input type="file" accept="image/*" onchange="handleAvatarUpload('${p.id}', this)"></div>
+        <div class="field"><label>Nome</label><input value="${p.name}" onchange="updateField('${p.id}','name', this.value)"></div>
+        <div class="field"><label>Data de nascimento</label><input type="date" value="${p.birthdate}" onchange="updateField('${p.id}','birthdate', this.value)"></div>
+        <div class="field"><label>Cor do personagem</label><input type="color" value="${p.color}" onchange="updateField('${p.id}','color', this.value)" style="height:38px; padding:3px;"></div>
+      </div>
+    `).join('')}
+  </div>
+  <div class="card" style="margin-top:18px;">
+    <p style="color:var(--muted); font-size:12.5px; line-height:1.6;">
+      ✅ Dados salvos no Supabase — tudo que vocês fizerem aqui persiste entre dispositivos e sessões.
+    </p>
+  </div>`;
+}
+async function updateField(id, field, value){
+  state.players[id][field] = value;
+  await persistPlayer(id);
+  render();
+}
+
+function renderGM(){
+  return `
+  <h2 class="section-title">🛡️ Painel do Game Master</h2>
+  <div class="card" style="margin-bottom:18px;">
+    <div style="font-weight:800; font-size:14px; margin-bottom:10px;">Conceder XP manualmente</div>
+    <div class="form-row">
+      <div class="field"><label>Jogador</label><select id="gm-player"><option value="p1">${state.players.p1.name}</option><option value="p2">${state.players.p2.name}</option><option value="both">Casal (ambos)</option></select></div>
+      <div class="field"><label>Área</label><select id="gm-area">${Object.entries(AREAS).map(([k,v])=>`<option value="${k}">${v.icon} ${v.name}</option>`).join('')}</select></div>
+    </div>
+    <div class="field"><label>Quantidade de XP</label><input id="gm-xp" type="number" value="20"></div>
+    <button class="btn" onclick="gmGrantXp()">Conceder XP</button>
+  </div>
+  <div class="card">
+    <div style="font-weight:800; font-size:14px; margin-bottom:6px;">Atalhos</div>
+    <div style="display:flex; flex-direction:column; gap:10px; margin-top:10px;">
+      <button class="btn secondary" onclick="setTab('achievements')">🏅 Gerenciar Conquistas</button>
+      <button class="btn secondary" onclick="setTab('profile')">⚙️ Editar Perfis</button>
+    </div>
+  </div>`;
+}
+async function gmGrantXp(){
+  const player = document.getElementById('gm-player').value;
+  const area = document.getElementById('gm-area').value;
+  const xp = parseInt(document.getElementById('gm-xp').value)||0;
+  if(!xp){ toast('Defina uma quantidade de XP 🙂'); return; }
+  await grantXp(player, area, xp);
+  toast(`+${xp} XP concedido(s)! 🛡️`);
+  render();
+}
+
+function toast(msg, isError){
+  const el = document.createElement('div');
+  el.className = 'toast' + (isError ? ' error' : '');
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(()=>el.remove(), 2800);
+}
+
+loadAll();
+</script>
+</body>
+</html>
